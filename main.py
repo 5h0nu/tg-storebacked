@@ -18,8 +18,9 @@ BOT_TOKENS = [
 ]
 
 class BotPool:
-    # FIXED: Added double underscores __init__
     def __init__(self, tokens):
+        # FIXED: Changed _init_ to __init__
+        self.tokens = tokens
         self.clients = [TelegramClient(StringSession(), API_ID, API_HASH) for _ in tokens]
         self.entities = {} 
         self._cursor = 0
@@ -27,15 +28,15 @@ class BotPool:
     async def start(self):
         for i, client in enumerate(self.clients):
             try:
-                # Ensure we use the correct token from the list
-                await client.start(bot_token=BOT_TOKENS[i])
+                # Use the specific token for each client
+                await client.start(bot_token=self.tokens[i])
                 self.entities[client] = await client.get_input_entity(CHANNEL_ID)
                 print(f"✅ Bot {i+1} Ready")
             except Exception as e:
                 print(f"⚠️ Bot {i+1} Sync Error: {e}")
 
     def get_next(self):
-        if not self.clients: return None, None
+        # Round-robin selection of an active bot
         for _ in range(len(self.clients)):
             c = self.clients[self._cursor]
             e = self.entities.get(c)
@@ -43,6 +44,7 @@ class BotPool:
             if e: return c, e
         return None, None
 
+# Initialize the pool
 pool = BotPool(BOT_TOKENS)
 
 def generate_key(length=8):
@@ -58,29 +60,41 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Attempt to start bots
     await pool.start()
     yield
+    # Cleanup on shutdown
     for c in pool.clients: 
         if c.is_connected():
             await c.disconnect()
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Standard CORS - Change allow_origins to your frontend domain in production
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    key_part = generate_key(5)
-    temp_path = f"temp_{key_part}_{file.filename}"
+    temp_path = f"temp_{generate_key(5)}_{file.filename}"
     try:
         content = await file.read()
-        with open(temp_path, "wb") as f: f.write(content)
+        with open(temp_path, "wb") as f: 
+            f.write(content)
         
         worker, entity = pool.get_next()
-        if not worker: raise HTTPException(status_code=503, detail="Bots offline")
+        if not worker: 
+            raise HTTPException(status_code=503, detail="All bots are currently offline or rate-limited.")
 
+        # Upload to Telegram
         msg = await worker.send_file(entity, temp_path, caption=file.filename)
         file_key = generate_key().upper()
         
+        # Save metadata to local SQLite
         conn = sqlite3.connect("storage.db")
         conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?)", 
                      (file_key, msg.id, file.filename, file.content_type, f"{len(content)/1048576:.2f} MB"))
@@ -88,26 +102,41 @@ async def upload(file: UploadFile = File(...)):
         conn.close()
 
         return {"file_id": file_key, "name": file.filename}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
     finally:
-        if os.path.exists(temp_path): os.remove(temp_path)
+        if os.path.exists(temp_path): 
+            os.remove(temp_path)
 
 @app.get("/download/{file_key}")
 async def download(file_key: str):
     conn = sqlite3.connect("storage.db")
     res = conn.execute("SELECT msg_id, type FROM files WHERE file_key = ?", (file_key.upper(),)).fetchone()
     conn.close()
-    if not res: raise HTTPException(status_code=404)
+    
+    if not res: 
+        raise HTTPException(status_code=404, detail="File not found")
     
     msg_id, mime = res
     worker, entity = pool.get_next()
-    if not worker: raise HTTPException(status_code=503, detail="Bots offline")
     
+    if not worker:
+        raise HTTPException(status_code=503, detail="Bots offline")
+        
     msg = await worker.get_messages(entity, ids=msg_id)
     
+    if not msg or not msg.media:
+        raise HTTPException(status_code=404, detail="Message or media no longer exists on Telegram")
+
     async def stream():
-        async for chunk in worker.iter_download(msg.media): yield chunk
+        async for chunk in worker.iter_download(msg.media): 
+            yield chunk
+
     return StreamingResponse(stream(), media_type=mime)
 
-# FIXED: Added double underscores __name__ and __main__
+# FIXED: Changed _name_ to __name__ and _main_ to __main__
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
