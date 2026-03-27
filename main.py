@@ -28,7 +28,7 @@ class BotPool:
             try:
                 await client.start(bot_token=BOT_TOKENS[i])
                 self.entities[client] = await client.get_input_entity(CHANNEL_ID)
-                print(f"✅ Bot {i+1} Connected to Channel")
+                print(f"✅ Bot {i+1} Connected")
             except Exception as e:
                 print(f"⚠️ Bot {i+1} Error: {e}")
 
@@ -57,10 +57,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# CRITICAL: Allow CORS so the browser accepts the "Success" signal
+# THE CORS FIX
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -69,34 +70,24 @@ app.add_middleware(
 async def upload(file: UploadFile = File(...)):
     key = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
     temp_name = f"tmp_{key}_{file.filename}"
-    
     try:
-        print(f"📥 Receiving: {file.filename}")
-        with open(temp_name, "wb") as f: 
-            f.write(await file.read())
-        
+        with open(temp_name, "wb") as f: f.write(await file.read())
         worker, entity = pool.get_next()
-        if not worker: raise HTTPException(503, "No bots available")
-
-        print(f"📤 Uploading to Telegram via Bot Pool...")
-        # This is where it usually hangs if bots aren't Admins
+        
+        # UPLOADING TO TELEGRAM
         msg = await worker.send_file(entity, temp_name)
         
-        print(f"💾 Saving to Database: {key}")
         conn = sqlite3.connect("storage.db")
         conn.execute("INSERT INTO files VALUES (?, ?, ?, ?)", (key, msg.id, file.filename, file.content_type))
         conn.commit()
         conn.close()
         
-        print(f"✨ Done! Returning Key: {key}")
         return {"file_id": key, "name": file.filename}
-        
     except Exception as e:
-        print(f"❌ Server Error: {e}")
-        raise HTTPException(500, str(e))
+        print(f"ERROR: {e}")
+        raise HTTPException(500, detail=str(e))
     finally:
-        if os.path.exists(temp_name): 
-            os.remove(temp_name)
+        if os.path.exists(temp_name): os.remove(temp_name)
 
 @app.get("/download/{key}")
 async def download(key: str):
@@ -104,7 +95,6 @@ async def download(key: str):
     res = conn.execute("SELECT msg_id, type FROM files WHERE file_key = ?", (key.upper(),)).fetchone()
     conn.close()
     if not res: raise HTTPException(404)
-    
     worker, entity = pool.get_next()
     msg = await worker.get_messages(entity, ids=res[0])
     return StreamingResponse(worker.iter_download(msg.media), media_type=res[1])
