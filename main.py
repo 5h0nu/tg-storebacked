@@ -19,8 +19,6 @@ BOT_TOKENS = [
 
 class BotPool:
     def __init__(self, tokens):
-        # FIXED: Changed _init_ to __init__
-        self.tokens = tokens
         self.clients = [TelegramClient(StringSession(), API_ID, API_HASH) for _ in tokens]
         self.entities = {} 
         self._cursor = 0
@@ -28,15 +26,13 @@ class BotPool:
     async def start(self):
         for i, client in enumerate(self.clients):
             try:
-                # Use the specific token for each client
-                await client.start(bot_token=self.tokens[i])
+                await client.start(bot_token=BOT_TOKENS[i])
                 self.entities[client] = await client.get_input_entity(CHANNEL_ID)
-                print(f"✅ Bot {i+1} Ready")
+                print(f"✅ Bot {i+1} Connected to Channel")
             except Exception as e:
-                print(f"⚠️ Bot {i+1} Sync Error: {e}")
+                print(f"⚠️ Bot {i+1} Error: {e}")
 
     def get_next(self):
-        # Round-robin selection of an active bot
         for _ in range(len(self.clients)):
             c = self.clients[self._cursor]
             e = self.entities.get(c)
@@ -44,99 +40,74 @@ class BotPool:
             if e: return c, e
         return None, None
 
-# Initialize the pool
 pool = BotPool(BOT_TOKENS)
-
-def generate_key(length=8):
-    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
 def init_db():
     conn = sqlite3.connect("storage.db")
-    conn.execute('''CREATE TABLE IF NOT EXISTS files 
-                 (file_key TEXT PRIMARY KEY, msg_id INTEGER, name TEXT, type TEXT, size TEXT)''')
+    conn.execute("CREATE TABLE IF NOT EXISTS files (file_key TEXT PRIMARY KEY, msg_id INTEGER, name TEXT, type TEXT)")
     conn.commit()
     conn.close()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    # Attempt to start bots
     await pool.start()
     yield
-    # Cleanup on shutdown
-    for c in pool.clients: 
-        if c.is_connected():
-            await c.disconnect()
+    for c in pool.clients: await c.disconnect()
 
 app = FastAPI(lifespan=lifespan)
 
-# Standard CORS - Change allow_origins to your frontend domain in production
+# CRITICAL: Allow CORS so the browser accepts the "Success" signal
 app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"], 
-    allow_methods=["*"], 
-    allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    temp_path = f"temp_{generate_key(5)}_{file.filename}"
+    key = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    temp_name = f"tmp_{key}_{file.filename}"
+    
     try:
-        content = await file.read()
-        with open(temp_path, "wb") as f: 
-            f.write(content)
+        print(f"📥 Receiving: {file.filename}")
+        with open(temp_name, "wb") as f: 
+            f.write(await file.read())
         
         worker, entity = pool.get_next()
-        if not worker: 
-            raise HTTPException(status_code=503, detail="All bots are currently offline or rate-limited.")
+        if not worker: raise HTTPException(503, "No bots available")
 
-        # Upload to Telegram
-        msg = await worker.send_file(entity, temp_path, caption=file.filename)
-        file_key = generate_key().upper()
+        print(f"📤 Uploading to Telegram via Bot Pool...")
+        # This is where it usually hangs if bots aren't Admins
+        msg = await worker.send_file(entity, temp_name)
         
-        # Save metadata to local SQLite
+        print(f"💾 Saving to Database: {key}")
         conn = sqlite3.connect("storage.db")
-        conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?)", 
-                     (file_key, msg.id, file.filename, file.content_type, f"{len(content)/1048576:.2f} MB"))
+        conn.execute("INSERT INTO files VALUES (?, ?, ?, ?)", (key, msg.id, file.filename, file.content_type))
         conn.commit()
         conn.close()
-
-        return {"file_id": file_key, "name": file.filename}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if os.path.exists(temp_path): 
-            os.remove(temp_path)
-
-@app.get("/download/{file_key}")
-async def download(file_key: str):
-    conn = sqlite3.connect("storage.db")
-    res = conn.execute("SELECT msg_id, type FROM files WHERE file_key = ?", (file_key.upper(),)).fetchone()
-    conn.close()
-    
-    if not res: 
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    msg_id, mime = res
-    worker, entity = pool.get_next()
-    
-    if not worker:
-        raise HTTPException(status_code=503, detail="Bots offline")
         
-    msg = await worker.get_messages(entity, ids=msg_id)
+        print(f"✨ Done! Returning Key: {key}")
+        return {"file_id": key, "name": file.filename}
+        
+    except Exception as e:
+        print(f"❌ Server Error: {e}")
+        raise HTTPException(500, str(e))
+    finally:
+        if os.path.exists(temp_name): 
+            os.remove(temp_name)
+
+@app.get("/download/{key}")
+async def download(key: str):
+    conn = sqlite3.connect("storage.db")
+    res = conn.execute("SELECT msg_id, type FROM files WHERE file_key = ?", (key.upper(),)).fetchone()
+    conn.close()
+    if not res: raise HTTPException(404)
     
-    if not msg or not msg.media:
-        raise HTTPException(status_code=404, detail="Message or media no longer exists on Telegram")
+    worker, entity = pool.get_next()
+    msg = await worker.get_messages(entity, ids=res[0])
+    return StreamingResponse(worker.iter_download(msg.media), media_type=res[1])
 
-    async def stream():
-        async for chunk in worker.iter_download(msg.media): 
-            yield chunk
-
-    return StreamingResponse(stream(), media_type=mime)
-
-# FIXED: Changed _name_ to __name__ and _main_ to __main__
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
