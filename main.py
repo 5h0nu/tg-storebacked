@@ -18,7 +18,8 @@ BOT_TOKENS = [
 ]
 
 class BotPool:
-    def _init_(self, tokens):
+    # FIXED: Added double underscores __init__
+    def __init__(self, tokens):
         self.clients = [TelegramClient(StringSession(), API_ID, API_HASH) for _ in tokens]
         self.entities = {} 
         self._cursor = 0
@@ -26,6 +27,7 @@ class BotPool:
     async def start(self):
         for i, client in enumerate(self.clients):
             try:
+                # Ensure we use the correct token from the list
                 await client.start(bot_token=BOT_TOKENS[i])
                 self.entities[client] = await client.get_input_entity(CHANNEL_ID)
                 print(f"✅ Bot {i+1} Ready")
@@ -33,6 +35,7 @@ class BotPool:
                 print(f"⚠️ Bot {i+1} Sync Error: {e}")
 
     def get_next(self):
+        if not self.clients: return None, None
         for _ in range(len(self.clients)):
             c = self.clients[self._cursor]
             e = self.entities.get(c)
@@ -57,14 +60,17 @@ async def lifespan(app: FastAPI):
     init_db()
     await pool.start()
     yield
-    for c in pool.clients: await c.disconnect()
+    for c in pool.clients: 
+        if c.is_connected():
+            await c.disconnect()
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[""], allow_methods=[""], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    temp_path = f"temp_{generate_key(5)}_{file.filename}"
+    key_part = generate_key(5)
+    temp_path = f"temp_{key_part}_{file.filename}"
     try:
         content = await file.read()
         with open(temp_path, "wb") as f: f.write(content)
@@ -72,11 +78,9 @@ async def upload(file: UploadFile = File(...)):
         worker, entity = pool.get_next()
         if not worker: raise HTTPException(status_code=503, detail="Bots offline")
 
-        # Upload to TG
         msg = await worker.send_file(entity, temp_path, caption=file.filename)
         file_key = generate_key().upper()
         
-        # Save to Railway Local DB
         conn = sqlite3.connect("storage.db")
         conn.execute("INSERT INTO files VALUES (?, ?, ?, ?, ?)", 
                      (file_key, msg.id, file.filename, file.content_type, f"{len(content)/1048576:.2f} MB"))
@@ -96,11 +100,14 @@ async def download(file_key: str):
     
     msg_id, mime = res
     worker, entity = pool.get_next()
+    if not worker: raise HTTPException(status_code=503, detail="Bots offline")
+    
     msg = await worker.get_messages(entity, ids=msg_id)
     
     async def stream():
         async for chunk in worker.iter_download(msg.media): yield chunk
     return StreamingResponse(stream(), media_type=mime)
 
-if _name_ == "_main_":
+# FIXED: Added double underscores __name__ and __main__
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
